@@ -129,6 +129,27 @@ func (as *AutoScaler) scalingHint() ScalingDirection {
 	return NONE
 }
 
+// getMetricsAvg will return the metrics avg
+// return -1 if not enough data or not valid data
+func (as *AutoScaler) getMetricsAvgPerc() int {
+	avg := -1
+	if as.esMSet == nil {
+		return avg
+	}
+
+	// we filter data that are more that 3 min old
+	now := time.Now()
+	count := 0
+	for _, metric := range as.esMSet.Metrics {
+		if now.Sub(metric.Timestamp.Time).Seconds() < 180 {
+			count++
+			avg += int(metric.Value)
+		}
+	}
+
+	return avg / count
+}
+
 // TODO: check alternative approach by configuring the tags used for `index.routing.allocation`
 // and deriving the indices from there.
 func (as *AutoScaler) GetScalingOperation() (*ScalingOperation, error) {
@@ -275,12 +296,25 @@ func (as *AutoScaler) scaleUpOrDown(esIndices map[string]ESIndex, scalingHint Sc
 					return noopScalingOperation(fmt.Sprintf("Not allowed to scale up due to maxIndexReplicas (%d) reached for index %s.",
 						scalingSpec.MaxIndexReplicas, index.Index))
 				}
-				newTotalShards += index.Primaries
-				newDesiredIndexReplicas = append(newDesiredIndexReplicas, ESIndex{
-					Index:     index.Index,
-					Primaries: index.Primaries,
-					Replicas:  index.Replicas + 1,
-				})
+				metricAvg := as.getMetricsAvgPerc()
+				// when cpu is bigger than 70% we want to setup more aggressive scaling
+				if metricAvg > 70 {
+					toAdd := int32(math.Round(math.Max(1, (float64((int(index.Replicas)+1)*metricAvg) / 100))))
+					as.logger.Infof("aggresive autoscaling: %s, avg cpu: %d, replica to add: %d", index.Index, metricAvg, toAdd)
+					newTotalShards += toAdd * index.Primaries
+					newDesiredIndexReplicas = append(newDesiredIndexReplicas, ESIndex{
+						Index:     index.Index,
+						Primaries: index.Primaries,
+						Replicas:  index.Replicas + toAdd,
+					})
+				} else {
+					newTotalShards += index.Primaries
+					newDesiredIndexReplicas = append(newDesiredIndexReplicas, ESIndex{
+						Index:     index.Index,
+						Primaries: index.Primaries,
+						Replicas:  index.Replicas + 1,
+					})
+				}
 			}
 			if newTotalShards != currentTotalShards {
 				newDesiredNodeReplicas := as.ensureUpperBoundNodeReplicas(scalingSpec, calculateNodesWithSameShardToNodeRatio(currentDesiredNodeReplicas, currentTotalShards, newTotalShards))
@@ -305,12 +339,25 @@ func (as *AutoScaler) scaleUpOrDown(esIndices map[string]ESIndex, scalingHint Sc
 		newTotalShards := currentTotalShards
 		for _, index := range esIndices {
 			if index.Replicas > scalingSpec.MinIndexReplicas {
-				newTotalShards -= index.Primaries
-				newDesiredIndexReplicas = append(newDesiredIndexReplicas, ESIndex{
-					Index:     index.Index,
-					Primaries: index.Primaries,
-					Replicas:  index.Replicas - 1,
-				})
+				metricAvg := as.getMetricsAvgPerc()
+				aggresiveToRemove := int32(math.Trunc(math.Max(1, (float64((int(index.Replicas)+1)*(50-metricAvg)) / 100))))
+				// when cpu is less than 20% we want to setup more aggressive downscalling
+				if metricAvg > 0 && metricAvg < 20 && index.Replicas-aggresiveToRemove > 2 && index.Replicas-aggresiveToRemove > scalingSpec.MinIndexReplicas {
+					as.logger.Infof("aggresive downscaling: %s, avg cpu: %d, replica to remove: %d", index.Index, metricAvg, aggresiveToRemove)
+					newTotalShards -= aggresiveToRemove * index.Primaries
+					newDesiredIndexReplicas = append(newDesiredIndexReplicas, ESIndex{
+						Index:     index.Index,
+						Primaries: index.Primaries,
+						Replicas:  index.Replicas - aggresiveToRemove,
+					})
+				} else {
+					newTotalShards -= index.Primaries
+					newDesiredIndexReplicas = append(newDesiredIndexReplicas, ESIndex{
+						Index:     index.Index,
+						Primaries: index.Primaries,
+						Replicas:  index.Replicas - 1,
+					})
+				}
 			}
 		}
 		if newTotalShards != currentTotalShards {
